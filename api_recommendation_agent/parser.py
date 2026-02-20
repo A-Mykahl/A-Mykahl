@@ -93,8 +93,11 @@ def parse_openapi_spec(source):
 def parse_text_doc(text):
     """Parse a plain-text or markdown API doc into endpoint entries.
 
-    Uses heuristics: lines that look like 'GET /something' or
-    'POST https://api.example.com/v1/something' are endpoints.
+    Detects:
+      - REST: lines like 'GET /something' or 'POST https://api.example.com/v1/path'
+      - GraphQL: 'query { ... }', 'mutation { ... }', or '/graphql' endpoint references
+      - Webhook: 'webhook' or 'callback URL' references with paths
+      - Streaming: SSE, event-stream, or streaming endpoint references
 
     Args:
         text: Raw string of API documentation.
@@ -104,8 +107,8 @@ def parse_text_doc(text):
     """
     endpoints = []
 
-    # Match patterns like: GET /path, POST https://host/path, etc.
-    pattern = re.compile(
+    # --- REST endpoints ---
+    rest_pattern = re.compile(
         r"(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+"
         r"(https?://[^\s]+|/\S+)",
         re.IGNORECASE,
@@ -113,7 +116,7 @@ def parse_text_doc(text):
 
     lines = text.splitlines()
     for i, line in enumerate(lines):
-        match = pattern.search(line)
+        match = rest_pattern.search(line)
         if match:
             method = match.group(1).upper()
             raw_path = match.group(2)
@@ -130,7 +133,7 @@ def parse_text_doc(text):
             desc = ""
             for next_line in lines[i + 1 : i + 5]:
                 stripped = next_line.strip()
-                if stripped and not pattern.search(stripped):
+                if stripped and not rest_pattern.search(stripped):
                     desc = stripped.lstrip("- :")
                     break
 
@@ -142,6 +145,66 @@ def parse_text_doc(text):
                 "parameters": [],
                 "tags": [],
             })
+
+    # --- GraphQL operations ---
+    graphql_pattern = re.compile(
+        r"(query|mutation|subscription)\s+(\w+)?\s*[\({]",
+        re.IGNORECASE,
+    )
+    for i, line in enumerate(lines):
+        match = graphql_pattern.search(line)
+        if match:
+            op_type = match.group(1).lower()
+            op_name = match.group(2) or "unnamed"
+
+            desc = ""
+            for next_line in lines[i + 1 : i + 5]:
+                stripped = next_line.strip()
+                if stripped and not graphql_pattern.search(stripped) and not stripped.startswith(("{", "}")):
+                    desc = stripped.lstrip("- :#")
+                    break
+
+            method_map = {"query": "GET", "mutation": "POST", "subscription": "POST"}
+            endpoints.append({
+                "path": f"/graphql#{op_type}.{op_name}",
+                "method": method_map.get(op_type, "POST"),
+                "summary": desc[:200] or f"GraphQL {op_type}: {op_name}",
+                "description": f"GraphQL {op_type} operation. {desc}",
+                "parameters": [],
+                "tags": ["graphql"],
+            })
+
+    # --- Webhook / callback references ---
+    webhook_pattern = re.compile(
+        r"(webhook|callback)\s*(?:url|endpoint|path)?\s*[:=]?\s*(https?://[^\s]+|/\S+)",
+        re.IGNORECASE,
+    )
+    for i, line in enumerate(lines):
+        match = webhook_pattern.search(line)
+        if match:
+            raw_path = match.group(2)
+            if raw_path.startswith("http"):
+                from urllib.parse import urlparse
+                path = urlparse(raw_path).path or "/webhook"
+            else:
+                path = raw_path
+
+            # Avoid duplicating if we already found this as a REST endpoint
+            if not any(ep["path"] == path for ep in endpoints):
+                desc = ""
+                for next_line in lines[i + 1 : i + 5]:
+                    stripped = next_line.strip()
+                    if stripped:
+                        desc = stripped.lstrip("- :")
+                        break
+                endpoints.append({
+                    "path": path,
+                    "method": "POST",
+                    "summary": desc[:200] or f"Webhook callback endpoint",
+                    "description": f"Webhook/callback. {desc}",
+                    "parameters": [],
+                    "tags": ["webhook"],
+                })
 
     return endpoints
 

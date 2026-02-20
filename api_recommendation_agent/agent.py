@@ -2,8 +2,9 @@
 Core API Recommendation Agent — Cybersecurity Edition.
 
 Takes parsed API endpoints from security vendor documentation,
-classifies them into SOC/IR capability categories, and produces
-actionable recommendations for platform integration.
+classifies them into SOC/IR capability categories, detects integration
+methods (REST, GraphQL, webhook, streaming, etc.), flags suggested APIs
+for uncertain matches, and produces actionable recommendations.
 
 Uses rule-based classification offline, and optionally the
 Anthropic Claude API for deeper integration planning.
@@ -35,6 +36,29 @@ CAPABILITY_RULES = {
             "notification", "trigger", "rule", "signature", "match",
         ],
         "description": "Retrieve detections, alerts, and incidents from security products",
+        "soc_priority": 1,
+    },
+    # --- Data Source & Field Discovery ---
+    "source_discovery": {
+        "methods": ["GET", "POST"],
+        "path_hints": [
+            "source", "sources", "log_source", "logsource", "data_source",
+            "datasource", "input", "inputs", "connector", "integration",
+            "feed", "collector", "receiver", "origin", "tenant",
+            "sensor", "forwarder", "index", "indexes", "repository",
+        ],
+        "description": "Discover available data sources, log sources, connectors, and ingestion points",
+        "soc_priority": 1,
+    },
+    "field_schema": {
+        "methods": ["GET", "POST"],
+        "path_hints": [
+            "field", "fields", "schema", "column", "attribute", "property",
+            "metadata", "mapping", "type", "definition", "model", "describe",
+            "introspect", "catalog", "dictionary", "enum", "taxonomy",
+            "label", "tag", "key",
+        ],
+        "description": "Get field names, schemas, data types, and metadata for source data",
         "soc_priority": 1,
     },
     # --- Alert & Incident Management ---
@@ -163,73 +187,139 @@ CAPABILITY_RULES = {
     },
 }
 
+# Priority labels for display
+PRIORITY_LABELS = {0: "SETUP", 1: "CRITICAL", 2: "HIGH", 3: "MEDIUM", 4: "LOW"}
+
+
+# ---------------------------------------------------------------------------
+# Integration method detection
+# ---------------------------------------------------------------------------
+
+def detect_integration_method(endpoint):
+    """Detect what integration method an endpoint uses.
+
+    Returns a string: 'rest', 'graphql', 'webhook', 'streaming',
+    'websocket', 'grpc', or 'soap'.
+    """
+    path = endpoint.get("path", "").lower()
+    text = (endpoint.get("summary", "") + " " + endpoint.get("description", "")).lower()
+    method = endpoint.get("method", "").upper()
+    tags = " ".join(endpoint.get("tags", [])).lower()
+    all_text = f"{path} {text} {tags}"
+
+    if "graphql" in all_text or "query {" in text or "mutation {" in text:
+        return "graphql"
+    if "websocket" in all_text or "wss:" in all_text or "ws:" in all_text:
+        return "websocket"
+    if "grpc" in all_text or "protobuf" in all_text:
+        return "grpc"
+    if "soap" in all_text or "wsdl" in all_text or "xml-rpc" in all_text:
+        return "soap"
+    if any(kw in all_text for kw in ["stream", "sse", "server-sent", "event-stream", "firehose", "realtime"]):
+        return "streaming"
+    if any(kw in all_text for kw in ["webhook", "hook", "callback", "subscribe", "push notification"]):
+        return "webhook"
+    return "rest"
+
+
+def detect_all_methods(endpoints):
+    """Summarize all integration methods found across endpoints.
+
+    Returns a dict of {method_name: [endpoints using it]}.
+    """
+    methods = {}
+    for ep in endpoints:
+        m = detect_integration_method(ep)
+        methods.setdefault(m, []).append(f"{ep['method']} {ep['path']}")
+    return methods
+
+
+# ---------------------------------------------------------------------------
+# Endpoint classification
+# ---------------------------------------------------------------------------
 
 def classify_endpoint(endpoint):
     """Classify a single endpoint into cybersecurity capability categories.
 
-    Returns a list of matched capability names, sorted by SOC priority.
+    Returns a tuple: (matched_capabilities, confidence).
+    confidence is 'strong' if method+path both matched,
+    'suggested' if only text/description matched but method didn't align perfectly.
     """
     method = endpoint.get("method", "").upper()
     path = endpoint.get("path", "").lower()
     text = (endpoint.get("summary", "") + " " + endpoint.get("description", "")).lower()
 
-    matches = []
+    strong_matches = []
+    suggested_matches = []
+
     for cap_name, rule in CAPABILITY_RULES.items():
         method_match = method in rule["methods"]
-        hint_match = any(hint in path or hint in text for hint in rule["path_hints"])
+        path_match = any(hint in path for hint in rule["path_hints"])
+        text_match = any(hint in text for hint in rule["path_hints"])
 
-        if method_match and hint_match:
-            matches.append((rule["soc_priority"], cap_name))
+        if method_match and path_match:
+            strong_matches.append((rule["soc_priority"], cap_name))
+        elif method_match and text_match:
+            strong_matches.append((rule["soc_priority"], cap_name))
+        elif path_match or text_match:
+            # Path or description matches but HTTP method doesn't align —
+            # still worth surfacing as a suggestion
+            suggested_matches.append((rule["soc_priority"], cap_name))
 
-    # Sort by SOC priority (lower = more critical)
-    matches.sort(key=lambda x: x[0])
-    capabilities = [name for _, name in matches]
+    strong_matches.sort(key=lambda x: x[0])
+    suggested_matches.sort(key=lambda x: x[0])
 
-    # Fallback for unmatched endpoints
-    if not capabilities:
-        fallback = {
-            "GET": "detection_retrieval",
-            "POST": "alert_creation",
-            "PUT": "policy_management",
-            "PATCH": "policy_management",
-            "DELETE": "policy_management",
-        }
-        if method in fallback:
-            capabilities.append(fallback[method])
+    if strong_matches:
+        return [name for _, name in strong_matches], "strong"
 
-    return capabilities
+    if suggested_matches:
+        return [name for _, name in suggested_matches], "suggested"
+
+    # No match at all — still surface it as uncategorized suggestion
+    return ["uncategorized"], "suggested"
 
 
 def build_recommendations(endpoints, vendor_name=""):
     """Analyze all endpoints and produce SOC-focused integration recommendations.
 
-    Returns a dict with capabilities, recommendations, integration_playbook,
-    and a human-readable summary.
+    Returns a dict with capabilities, recommendations, suggested_apis,
+    integration_methods, integration_playbook, and a human-readable summary.
     """
     cap_groups = {}
-    for ep in endpoints:
-        caps = classify_endpoint(ep)
-        for cap in caps:
-            cap_groups.setdefault(cap, []).append(ep)
+    suggested_apis = []
+    all_recs = []
 
-    recommendations = []
-    for cap_name, eps in sorted(cap_groups.items(), key=lambda x: CAPABILITY_RULES.get(x[0], {}).get("soc_priority", 99)):
-        rule = CAPABILITY_RULES.get(cap_name, {})
-        rule_desc = rule.get("description", cap_name)
-        priority = rule.get("soc_priority", 99)
-        for ep in eps:
-            recommendations.append({
+    for ep in endpoints:
+        caps, confidence = classify_endpoint(ep)
+        integration_method = detect_integration_method(ep)
+
+        for cap in caps:
+            rec = {
                 "api": f"{ep['method']} {ep['path']}",
-                "capability": cap_name,
-                "capability_description": rule_desc,
-                "soc_priority": priority,
+                "capability": cap,
+                "capability_description": CAPABILITY_RULES.get(cap, {}).get("description", cap),
+                "soc_priority": CAPABILITY_RULES.get(cap, {}).get("soc_priority", 99),
+                "confidence": confidence,
+                "integration_method": integration_method,
                 "reason": ep.get("summary") or ep.get("description") or f"Matched by {ep['method']} + path pattern",
                 "tags": ep.get("tags", []),
                 "parameters": ep.get("parameters", []),
-            })
+            }
 
-    # Build integration playbook — ordered steps for a SOC integration
+            if confidence == "strong":
+                cap_groups.setdefault(cap, []).append(ep)
+                all_recs.append(rec)
+            else:
+                suggested_apis.append(rec)
+
+    # Sort confirmed recommendations by SOC priority
+    all_recs.sort(key=lambda r: (r["soc_priority"], r["capability"]))
+
+    # Build integration playbook from confirmed capabilities
     playbook = _build_integration_playbook(cap_groups)
+
+    # Detect integration methods across all endpoints
+    integration_methods = detect_all_methods(endpoints)
 
     # Human-readable summary
     summary_parts = []
@@ -237,9 +327,8 @@ def build_recommendations(endpoints, vendor_name=""):
     for cap_name, eps in sorted_caps:
         rule = CAPABILITY_RULES.get(cap_name, {})
         priority = rule.get("soc_priority", 99)
-        priority_label = {0: "SETUP", 1: "CRITICAL", 2: "HIGH", 3: "MEDIUM", 4: "LOW"}.get(priority, "INFO")
         summary_parts.append(
-            f"  [{priority_label}] {cap_name} ({len(eps)} endpoints): {rule.get('description', '')}"
+            f"  [{PRIORITY_LABELS.get(priority, 'INFO')}] {cap_name} ({len(eps)} endpoints): {rule.get('description', '')}"
         )
 
     vendor_label = f" — {vendor_name}" if vendor_name else ""
@@ -248,11 +337,14 @@ def build_recommendations(endpoints, vendor_name=""):
     return {
         "vendor": vendor_name,
         "capabilities": {k: [f"{e['method']} {e['path']}" for e in v] for k, v in cap_groups.items()},
-        "recommendations": recommendations,
+        "recommendations": all_recs,
+        "suggested_apis": suggested_apis,
+        "integration_methods": integration_methods,
         "integration_playbook": playbook,
         "summary": summary,
         "total_endpoints": len(endpoints),
         "total_capabilities": len(cap_groups),
+        "total_suggested": len(suggested_apis),
     }
 
 
@@ -261,22 +353,39 @@ def _build_integration_playbook(cap_groups):
     steps = []
     step_num = 0
 
-    # Priority order for SOC integration
     integration_order = [
-        ("api_authentication", "Authenticate to vendor API", "Set up OAuth/token auth. Store credentials securely. Implement token refresh."),
-        ("detection_retrieval", "Pull detections and alerts", "Poll or stream alerts into your platform. Map severity levels. Deduplicate."),
-        ("threat_hunting", "Enable event search and investigation", "Wire up query APIs for analyst investigation workflows. Build saved searches."),
-        ("intel_management", "Integrate threat intelligence", "Push IOC lists (hashes, IPs, domains) to the product. Set up feed sync schedules."),
-        ("response_actions", "Enable response playbooks", "Map containment actions (isolate host, block IP, kill process) to your playbook engine."),
-        ("alert_creation", "Push alerts back to vendor", "Forward correlated alerts or custom detections back into the security product."),
-        ("case_management", "Connect case/incident management", "Sync incidents, assignments, and status updates bidirectionally."),
-        ("identity_investigation", "Wire up identity investigation", "Enable analyst lookups of user sessions, auth events, and privilege changes."),
-        ("asset_management", "Sync asset inventory", "Pull host/device inventory for enrichment. Track agent health and coverage gaps."),
-        ("webhook_notification", "Set up real-time webhooks", "Subscribe to event streams for real-time alerting instead of polling."),
-        ("vulnerability_management", "Integrate vulnerability data", "Pull scan results and CVE data for risk-based prioritization."),
-        ("log_ingestion", "Configure log forwarding", "Push logs to SIEM or set up forwarding pipelines."),
-        ("policy_management", "Manage policies via API", "Automate policy updates, exclusion management, and detection rule tuning."),
-        ("reporting", "Pull reports and metrics", "Integrate dashboards and executive reporting into your platform."),
+        ("api_authentication", "Authenticate to vendor API",
+         "Set up OAuth/token auth. Store credentials securely. Implement token refresh."),
+        ("source_discovery", "Discover available data sources",
+         "Query available log sources, connectors, and data feeds. Map source names to your platform's taxonomy."),
+        ("field_schema", "Map fields and schemas",
+         "Pull field names, types, and metadata for each source. Build field mappings for normalization."),
+        ("detection_retrieval", "Pull detections and alerts",
+         "Poll or stream alerts into your platform. Map severity levels. Deduplicate."),
+        ("threat_hunting", "Enable event search and investigation",
+         "Wire up query APIs for analyst investigation workflows. Build saved searches."),
+        ("intel_management", "Integrate threat intelligence",
+         "Push IOC lists (hashes, IPs, domains) to the product. Set up feed sync schedules."),
+        ("response_actions", "Enable response playbooks",
+         "Map containment actions (isolate host, block IP, kill process) to your playbook engine."),
+        ("alert_creation", "Push alerts back to vendor",
+         "Forward correlated alerts or custom detections back into the security product."),
+        ("case_management", "Connect case/incident management",
+         "Sync incidents, assignments, and status updates bidirectionally."),
+        ("identity_investigation", "Wire up identity investigation",
+         "Enable analyst lookups of user sessions, auth events, and privilege changes."),
+        ("asset_management", "Sync asset inventory",
+         "Pull host/device inventory for enrichment. Track agent health and coverage gaps."),
+        ("webhook_notification", "Set up real-time webhooks",
+         "Subscribe to event streams for real-time alerting instead of polling."),
+        ("vulnerability_management", "Integrate vulnerability data",
+         "Pull scan results and CVE data for risk-based prioritization."),
+        ("log_ingestion", "Configure log forwarding",
+         "Push logs to SIEM or set up forwarding pipelines."),
+        ("policy_management", "Manage policies via API",
+         "Automate policy updates, exclusion management, and detection rule tuning."),
+        ("reporting", "Pull reports and metrics",
+         "Integrate dashboards and executive reporting into your platform."),
     ]
 
     for cap_name, title, detail in integration_order:
@@ -303,14 +412,20 @@ Your job is to analyze security vendor API documentation and advise on:
 1. Which APIs are most valuable for SOC operations (detection, investigation, response)
 2. Integration priority and sequencing
 3. Specific playbook patterns (e.g., "alert -> enrich -> investigate -> contain")
-4. Gotchas and rate limiting considerations
-5. How to map vendor-specific concepts to standard SOC workflows
+4. Source and field discovery — how to enumerate what data sources and fields are available
+5. Integration methods — REST, GraphQL, webhook, streaming, gRPC — and when to use each
+6. Gotchas: rate limiting, pagination, data format quirks
+7. How to map vendor-specific concepts to standard SOC workflows
+
+When you see endpoints that could serve multiple purposes, call them out as suggested uses.
+If you think the vendor likely has additional APIs not shown (e.g., missing source/field
+discovery, missing webhook support), note the gaps and suggest what to look for.
 
 Be specific and actionable. Reference actual endpoint paths. Think like a SOC engineer
 who needs to ship integrations that analysts will use daily."""
 
 
-def _llm_analyze(endpoints_json, vendor_name="", use_case=""):
+def _llm_analyze(endpoints_json, integration_methods, vendor_name="", use_case=""):
     """Use Claude to provide SOC-focused integration analysis."""
     try:
         import anthropic
@@ -324,9 +439,12 @@ def _llm_analyze(endpoints_json, vendor_name="", use_case=""):
 
     client = anthropic.Anthropic(api_key=api_key)
 
+    methods_summary = ", ".join(f"{m} ({len(eps)} endpoints)" for m, eps in integration_methods.items())
+
     prompt = f"""Analyze this security vendor API and provide integration recommendations for our SOC platform.
 
 Vendor: {vendor_name or "Unknown"}
+Integration methods detected: {methods_summary}
 {f"Use case: {use_case}" if use_case else ""}
 
 Endpoints:
@@ -334,17 +452,21 @@ Endpoints:
 
 Provide:
 1. **Priority Integration Order** — Which APIs to build first for maximum SOC value
-2. **Playbook Mappings** — How these APIs chain together in real incident response workflows
-   (e.g., "detection fires → query events → enrich with intel → isolate host")
-3. **Key Capabilities** — What this vendor API enables that's unique or critical
-4. **Integration Gotchas** — Rate limits, pagination, data format quirks to watch for
-5. **Coverage Gaps** — What's missing that you'd typically want from this type of vendor
+2. **Source & Field Discovery** — Which endpoints let us enumerate data sources and their field schemas.
+   If none are present, flag this as a gap and suggest how to discover them.
+3. **Playbook Mappings** — How these APIs chain together in real IR workflows
+   (e.g., "detection fires → get source fields → query events → enrich with intel → isolate host")
+4. **Integration Methods** — For each capability, which integration method is best
+   (REST polling, webhook push, GraphQL query, streaming, etc.) and why
+5. **Suggested API Uses** — Any endpoints that could serve double duty or have non-obvious uses
+   (e.g., a generic query endpoint that can also be used for source enumeration)
+6. **Coverage Gaps** — What's missing that you'd typically want from this type of vendor
 
 Be concise and specific. Reference actual endpoint paths."""
 
     message = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=2000,
+        max_tokens=2500,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -360,13 +482,18 @@ class APIRecommendationAgent:
     """Cybersecurity API Recommendation Agent.
 
     Ingests security vendor API documentation and produces SOC-focused
-    integration recommendations, capability assessments, and playbook mappings.
+    integration recommendations, capability assessments, playbook mappings,
+    and integration method analysis.
+
+    Accepts input as: OpenAPI spec (file/dict), plain text docs, or a URL.
+    Detects REST, GraphQL, webhook, streaming, WebSocket, gRPC, and SOAP.
 
     Usage:
         agent = APIRecommendationAgent()
         result = agent.analyze("crowdstrike_openapi.yaml", vendor="CrowdStrike")
         print(result["summary"])
         print(json.dumps(result["integration_playbook"], indent=2))
+        print(json.dumps(result["suggested_apis"], indent=2))
     """
 
     def __init__(self, use_llm=False):
@@ -382,13 +509,14 @@ class APIRecommendationAgent:
         """Analyze security vendor API documentation.
 
         Args:
-            source: File path (.json/.yaml/.yml), raw text, or dict of an API spec.
+            source: File path, URL, raw text, or dict of an API spec.
             vendor: Name of the security vendor (e.g., "CrowdStrike", "SentinelOne").
             use_case: Optional description of what you're building.
 
         Returns:
-            Dict with capabilities, recommendations, integration_playbook,
-            summary, and optionally llm_analysis.
+            Dict with: capabilities, recommendations, suggested_apis,
+            integration_methods, integration_playbook, summary,
+            and optionally llm_analysis.
         """
         endpoints = self.parser.parse(source)
 
@@ -397,10 +525,13 @@ class APIRecommendationAgent:
                 "vendor": vendor,
                 "capabilities": {},
                 "recommendations": [],
+                "suggested_apis": [],
+                "integration_methods": {},
                 "integration_playbook": [],
                 "summary": "No API endpoints found in the provided documentation.",
                 "total_endpoints": 0,
                 "total_capabilities": 0,
+                "total_suggested": 0,
             }
 
         result = build_recommendations(endpoints, vendor_name=vendor)
@@ -408,10 +539,17 @@ class APIRecommendationAgent:
         if self.use_llm:
             trimmed = json.dumps(
                 [{"method": e["method"], "path": e["path"],
-                  "summary": e.get("summary", "")} for e in endpoints],
+                  "summary": e.get("summary", ""),
+                  "integration_method": detect_integration_method(e)}
+                 for e in endpoints],
                 indent=2,
             )
-            llm_result = _llm_analyze(trimmed, vendor_name=vendor, use_case=use_case)
+            llm_result = _llm_analyze(
+                trimmed,
+                integration_methods=result["integration_methods"],
+                vendor_name=vendor,
+                use_case=use_case,
+            )
             if llm_result:
                 result["llm_analysis"] = llm_result
 
@@ -425,11 +563,23 @@ class APIRecommendationAgent:
         print(result["summary"])
         print(f"\nTotal endpoints scanned: {result['total_endpoints']}")
         print(f"Capability categories found: {result['total_capabilities']}")
+        print(f"Suggested/review APIs: {result['total_suggested']}")
         print("=" * 65)
+
+        # Print integration methods
+        if result["integration_methods"]:
+            print("\nIntegration Methods Detected:\n")
+            for method_name, eps in sorted(result["integration_methods"].items()):
+                print(f"  {method_name.upper()} ({len(eps)} endpoints)")
+                for ep in eps[:3]:
+                    print(f"      {ep}")
+                if len(eps) > 3:
+                    print(f"      ... and {len(eps) - 3} more")
+            print()
 
         # Print integration playbook
         if result["integration_playbook"]:
-            print("\nIntegration Playbook (recommended order):\n")
+            print("Integration Playbook (recommended order):\n")
             for step in result["integration_playbook"]:
                 print(f"  Step {step['step']}: {step['title']}")
                 print(f"         {step['detail']}")
@@ -438,17 +588,31 @@ class APIRecommendationAgent:
                     print(f"                    ... and {len(step['endpoints']) - 3} more")
                 print()
 
-        # Print recommendations grouped by capability
-        print("Detailed API Recommendations:\n")
+        # Print confirmed recommendations grouped by capability
+        print("Confirmed API Recommendations:\n")
         current_cap = None
         for rec in result["recommendations"]:
             if rec["capability"] != current_cap:
                 current_cap = rec["capability"]
-                priority_label = {0: "SETUP", 1: "CRITICAL", 2: "HIGH", 3: "MEDIUM", 4: "LOW"}.get(rec["soc_priority"], "INFO")
+                priority_label = PRIORITY_LABELS.get(rec["soc_priority"], "INFO")
                 print(f"  [{priority_label}] {current_cap.upper()}: {rec['capability_description']}")
-            print(f"      {rec['api']}")
+            method_tag = f" [{rec['integration_method']}]" if rec["integration_method"] != "rest" else ""
+            print(f"      {rec['api']}{method_tag}")
             if rec["reason"]:
                 print(f"        -> {rec['reason']}")
+
+        # Print suggested/uncertain APIs
+        if result["suggested_apis"]:
+            print(f"\nSuggested APIs (review for potential use):\n")
+            for rec in result["suggested_apis"]:
+                cap_desc = rec["capability_description"]
+                if rec["capability"] == "uncategorized":
+                    cap_desc = "Could not auto-classify — review manually"
+                method_tag = f" [{rec['integration_method']}]" if rec["integration_method"] != "rest" else ""
+                print(f"  [SUGGESTED] {rec['api']}{method_tag}")
+                print(f"      Possible use: {rec['capability']} — {cap_desc}")
+                if rec["reason"]:
+                    print(f"      Context: {rec['reason']}")
 
         if result.get("llm_analysis"):
             print("\n" + "=" * 65)

@@ -3,9 +3,10 @@
 Demo: Cybersecurity API Recommendation Agent
 
 Shows the agent analyzing security vendor APIs and producing
-SOC-focused integration recommendations and playbooks.
+SOC-focused integration recommendations, playbooks, source/field
+discovery, and multi-method integration detection.
 
-Supports: OpenAPI specs, plain text docs, URLs, and raw dicts.
+Supports: OpenAPI specs, plain text docs, URLs, GraphQL, webhooks.
 
 Run:
     python -m api_recommendation_agent.run_demo
@@ -22,6 +23,7 @@ from api_recommendation_agent import APIRecommendationAgent
 
 # ============================================================================
 # DEMO 1: EDR Vendor (CrowdStrike-style OpenAPI spec)
+#   Includes source/field discovery endpoints
 # ============================================================================
 
 EDR_VENDOR_SPEC = {
@@ -34,6 +36,34 @@ EDR_VENDOR_SPEC = {
                 "summary": "Get OAuth2 access token using client credentials",
                 "tags": ["auth"],
                 "requestBody": {"required": True, "content": {"application/x-www-form-urlencoded": {}}},
+            }
+        },
+        # --- Data Source & Field Discovery ---
+        "/discover/queries/data-sources/v1": {
+            "get": {
+                "summary": "List available data sources and log source types connected to the platform",
+                "tags": ["discover"],
+                "parameters": [
+                    {"name": "filter", "in": "query", "description": "Filter data sources by type or status"},
+                ],
+            }
+        },
+        "/discover/entities/data-sources/v1": {
+            "get": {
+                "summary": "Get data source details including ingestion status and event count",
+                "tags": ["discover"],
+            }
+        },
+        "/events/entities/fields/v1": {
+            "get": {
+                "summary": "List all available event fields, types, and descriptions for telemetry data",
+                "tags": ["event-search", "schema"],
+            }
+        },
+        "/events/entities/field-metadata/v1": {
+            "get": {
+                "summary": "Get field metadata including data type, searchable flag, and enum values",
+                "tags": ["event-search", "schema"],
             }
         },
         # --- Detections ---
@@ -164,6 +194,13 @@ EDR_VENDOR_SPEC = {
                 "tags": ["hosts"],
             }
         },
+        # --- Streaming (Event Stream) ---
+        "/sensors/entities/datafeed/v2": {
+            "get": {
+                "summary": "Get event stream URL for realtime streaming of detection and audit events",
+                "tags": ["streaming"],
+            }
+        },
         # --- Vulnerability / Spotlight ---
         "/spotlight/queries/vulnerabilities/v1": {
             "get": {
@@ -199,6 +236,7 @@ EDR_VENDOR_SPEC = {
 
 # ============================================================================
 # DEMO 2: SIEM Vendor (Splunk-style plain-text API doc)
+#   Includes source/field discovery and webhook support
 # ============================================================================
 
 SIEM_VENDOR_TEXT = """
@@ -207,6 +245,29 @@ Splunk Enterprise Security REST API
 Authentication:
 POST /services/auth/login
   Authenticate and retrieve a session token for subsequent API calls.
+
+Data Source Discovery:
+GET /services/data/inputs
+  List all configured data inputs (sources) including file monitors, network inputs, scripted inputs.
+
+GET /services/data/inputs/{type}
+  Get data source details by input type (monitor, tcp, udp, script, http).
+
+GET /services/data/indexes
+  List all available indexes and their properties. Each index represents a data source category.
+
+GET /services/data/indexes/{name}
+  Get detailed index metadata: event count, earliest/latest time, field summary.
+
+Field Discovery:
+GET /services/search/fields
+  List all indexed fields across all sources with type information and frequency.
+
+GET /services/search/fields/{field_name}
+  Get field details: data type, distinct values, sources where it appears.
+
+POST /services/search/jobs
+  Run 'metadata type=sources' or '| fieldsummary' SPL to discover sources and field schemas dynamically.
 
 Search & Investigation:
 POST /services/search/jobs
@@ -235,15 +296,16 @@ POST /services/data/threat_intel/upload
 GET /services/data/threat_intel/collections
   List available threat intel collections and their contents.
 
+Webhooks & Real-time:
+POST /services/alerts/webhook
+  Configure a webhook callback URL for real-time alert delivery.
+
 POST /services/data/inputs/oneshot
   Ingest a one-shot log event or batch of events into an index.
 
 Data Ingestion:
 POST /services/collectors/event
   Send events to HTTP Event Collector (HEC) for SIEM ingestion.
-
-GET /services/data/indexes
-  List all available indexes and their properties.
 
 Dashboards & Reporting:
 GET /services/saved/searches
@@ -258,7 +320,111 @@ GET /services/dashboards
 
 
 # ============================================================================
-# DEMO 3: SOAR Platform (Palo Alto XSOAR-style)
+# DEMO 3: XDR Platform with GraphQL + webhooks + REST (multi-method)
+# ============================================================================
+
+XDR_MULTI_METHOD_TEXT = """
+SecureXDR Platform API Documentation
+
+Authentication:
+POST /api/v2/auth/token
+  Exchange API key for bearer token. Tokens expire after 1 hour.
+
+=== REST API Endpoints ===
+
+Source & Connector Management:
+GET /api/v2/sources
+  List all connected data sources (EDR, firewall, email gateway, cloud, identity).
+
+GET /api/v2/sources/{source_id}/fields
+  Get available fields and schema for a specific data source.
+
+GET /api/v2/sources/{source_id}/field-mappings
+  Get field mapping definitions showing how source fields map to normalized schema.
+
+POST /api/v2/sources/{source_id}/test
+  Test connectivity to a data source and validate field mappings.
+
+Detection & Alerts:
+GET /api/v2/detections
+  List detections with filters for severity, source, status, time range.
+
+GET /api/v2/detections/{id}
+  Get detection details including matched rule, evidence, and timeline.
+
+POST /api/v2/detections
+  Create a custom detection or import detection from external source.
+
+Investigation:
+POST /api/v2/investigate/query
+  Run a cross-source investigation query across all connected data sources.
+
+GET /api/v2/investigate/events
+  Search raw events across all sources with unified query language.
+
+Response Actions:
+POST /api/v2/response/isolate-host
+  Isolate a compromised host from the network via EDR integration.
+
+POST /api/v2/response/block-ioc
+  Push IOC to all connected blocking points (firewall, EDR, proxy, email gateway).
+
+POST /api/v2/response/disable-account
+  Disable a user account across connected identity providers.
+
+POST /api/v2/response/playbook/execute
+  Execute a response playbook with parameters (host ID, IOC list, etc).
+
+Threat Intel:
+GET /api/v2/intel/iocs
+  Get all IOC indicators with reputation scores and source attribution.
+
+POST /api/v2/intel/iocs/bulk
+  Bulk upload IOC list (JSON array of hashes, IPs, domains, URLs).
+
+POST /api/v2/intel/enrichment
+  Enrich an observable (IP, hash, domain) with threat intel from all feeds.
+
+=== GraphQL API ===
+
+query getDetectionDetails {
+  Fetch full detection details including related events, entities, and MITRE mappings.
+
+query searchEvents {
+  Cross-source event search with field-level filtering and aggregation.
+
+query getSourceSchema {
+  Get complete field schema for any connected source, including data types and descriptions.
+
+mutation createAlert {
+  Create a custom alert with severity, description, entities, and evidence.
+
+mutation updateIncident {
+  Update incident status, assignment, priority, or add investigation notes.
+
+subscription detectionStream {
+  Subscribe to real-time detection stream via WebSocket for immediate alerting.
+
+=== Webhook Configuration ===
+
+POST /api/v2/webhooks
+  Register a webhook endpoint for real-time event delivery.
+
+GET /api/v2/webhooks
+  List all configured webhook subscriptions and their status.
+
+DELETE /api/v2/webhooks/{id}
+  Remove a webhook subscription.
+
+Webhook events delivered:
+  - detection.created: New detection fired
+  - incident.updated: Incident status changed
+  - response.completed: Response action finished
+"""
+
+
+# ============================================================================
+# DEMO 4: SOAR Platform (XSOAR-style)
 # ============================================================================
 
 SOAR_VENDOR_SPEC = {
@@ -287,6 +453,18 @@ SOAR_VENDOR_SPEC = {
         },
         "/incident/{id}/investigation": {
             "get": {"summary": "Get investigation war room entries and analyst actions", "tags": ["investigation"]},
+        },
+        "/incident/fields": {
+            "get": {"summary": "Get all incident field definitions, types, and mappings", "tags": ["schema"]},
+        },
+        "/incident/types": {
+            "get": {"summary": "List available incident types and their associated field schemas", "tags": ["schema"]},
+        },
+        "/integrations": {
+            "get": {"summary": "List all configured integration instances (data sources and connectors)", "tags": ["integrations"]},
+        },
+        "/integrations/{id}/test": {
+            "post": {"summary": "Test connectivity to an integration source", "tags": ["integrations"]},
         },
         "/indicators/search": {
             "post": {
@@ -334,57 +512,54 @@ SOAR_VENDOR_SPEC = {
 
 
 def demo_edr():
-    """Analyze an EDR vendor API (CrowdStrike-style)."""
+    """Analyze an EDR vendor API with source/field discovery."""
     print("\n" + "#" * 65)
-    print("# DEMO 1: EDR Vendor API Analysis (CrowdStrike-style)")
+    print("# DEMO 1: EDR Vendor (source/field discovery + streaming)")
     print("#" * 65 + "\n")
 
     agent = APIRecommendationAgent(use_llm=False)
     result = agent.analyze_and_print(EDR_VENDOR_SPEC, vendor="FalconEDR")
 
-    print("\n--- Platform Integration JSON ---\n")
+    print("\n--- Platform Integration JSON (abridged) ---\n")
     print(json.dumps({
         "vendor": result["vendor"],
-        "capabilities": result["capabilities"],
-        "integration_playbook": result["integration_playbook"],
+        "integration_methods": result["integration_methods"],
+        "capabilities": list(result["capabilities"].keys()),
+        "total_suggested": result["total_suggested"],
     }, indent=2))
 
 
 def demo_siem():
-    """Analyze a SIEM vendor API from plain-text docs (Splunk-style)."""
+    """Analyze a SIEM vendor API with source/field and webhook support."""
     print("\n\n" + "#" * 65)
-    print("# DEMO 2: SIEM Vendor API Analysis (Splunk-style text doc)")
+    print("# DEMO 2: SIEM Vendor (source/field discovery + webhooks)")
     print("#" * 65 + "\n")
 
     agent = APIRecommendationAgent(use_llm=False)
     agent.analyze_and_print(SIEM_VENDOR_TEXT, vendor="SplunkES")
 
 
-def demo_soar():
-    """Analyze a SOAR platform API (XSOAR-style)."""
+def demo_xdr_multi():
+    """Analyze an XDR platform with REST + GraphQL + webhooks + streaming."""
     print("\n\n" + "#" * 65)
-    print("# DEMO 3: SOAR Platform API Analysis (XSOAR-style)")
+    print("# DEMO 3: XDR Platform (REST + GraphQL + Webhook + Streaming)")
+    print("#" * 65 + "\n")
+
+    agent = APIRecommendationAgent(use_llm=False)
+    result = agent.analyze_and_print(XDR_MULTI_METHOD_TEXT, vendor="SecureXDR")
+
+    print("\n--- Integration Methods Breakdown ---\n")
+    print(json.dumps(result["integration_methods"], indent=2))
+
+
+def demo_soar():
+    """Analyze a SOAR platform API with field/integration discovery."""
+    print("\n\n" + "#" * 65)
+    print("# DEMO 4: SOAR Platform (field schemas + integrations)")
     print("#" * 65 + "\n")
 
     agent = APIRecommendationAgent(use_llm=False)
     agent.analyze_and_print(SOAR_VENDOR_SPEC, vendor="XSOAR")
-
-
-def demo_url():
-    """Show how to analyze a vendor API from a URL."""
-    print("\n\n" + "#" * 65)
-    print("# DEMO 4: Analyzing API Docs from a URL")
-    print("#" * 65 + "\n")
-    print("Usage (pass any vendor API doc URL):\n")
-    print("  from api_recommendation_agent import APIRecommendationAgent")
-    print("  agent = APIRecommendationAgent()")
-    print('  result = agent.analyze("https://assets.falcon.crowdstrike.com/...", vendor="CrowdStrike")')
-    print('  result = agent.analyze("https://docs.sentinelone.com/api/...", vendor="SentinelOne")')
-    print()
-    print("  The parser auto-detects format:")
-    print("    - JSON/YAML URL  -> parsed as OpenAPI spec")
-    print("    - HTML doc page  -> stripped to text, endpoints extracted")
-    print("    - Raw text       -> heuristic endpoint extraction")
 
 
 def demo_llm():
@@ -392,8 +567,9 @@ def demo_llm():
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         print("\n\n--- Skipping Claude analysis demo (set ANTHROPIC_API_KEY to enable) ---")
-        print("    With Claude enabled, the agent provides:")
-        print("    - Priority integration ordering with rationale")
+        print("    With Claude enabled, the agent additionally provides:")
+        print("    - Source/field discovery analysis and gap identification")
+        print("    - Integration method recommendations per capability")
         print("    - Incident response playbook chain mappings")
         print("    - Vendor-specific gotchas and rate limit advice")
         print("    - Coverage gap analysis vs. typical SOC needs")
@@ -409,8 +585,9 @@ def demo_llm():
         vendor="FalconEDR",
         use_case=(
             "We're building a SOC platform that needs to pull detections, "
-            "enable analyst investigation with event search, push IOC blocklists, "
-            "and trigger host isolation from playbooks."
+            "discover data sources and their field schemas, enable analyst "
+            "investigation with event search, push IOC blocklists, and "
+            "trigger host isolation from playbooks."
         ),
     )
 
@@ -418,8 +595,8 @@ def demo_llm():
 if __name__ == "__main__":
     demo_edr()
     demo_siem()
+    demo_xdr_multi()
     demo_soar()
-    demo_url()
     demo_llm()
 
     print("\n" + "=" * 65)
@@ -430,13 +607,12 @@ if __name__ == "__main__":
     print('  result = agent.analyze("vendor_api.yaml", vendor="CrowdStrike")\n')
     print("  # From a documentation URL:")
     print('  result = agent.analyze("https://docs.vendor.com/api", vendor="SentinelOne")\n')
-    print("  # From raw text docs:")
-    print('  result = agent.analyze("""')
-    print("    GET /detections  - List all detections")
-    print("    POST /iocs       - Push IOC indicators")
-    print('  """, vendor="CustomVendor")\n')
+    print("  # From raw text / markdown docs:")
+    print('  result = agent.analyze(open("vendor_docs.md").read(), vendor="PaloAlto")\n')
     print("  # Key outputs:")
-    print('  result["capabilities"]         # What the API can do')
+    print('  result["capabilities"]         # Confirmed capabilities by category')
+    print('  result["suggested_apis"]       # Uncertain matches — review these')
+    print('  result["integration_methods"]  # REST, GraphQL, webhook, streaming, etc.')
     print('  result["integration_playbook"] # Ordered steps to integrate')
     print('  result["recommendations"]      # Every endpoint with SOC context')
     print('  result["llm_analysis"]         # Claude deep analysis (if enabled)')
